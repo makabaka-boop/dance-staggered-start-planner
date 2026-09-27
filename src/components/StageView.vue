@@ -4,11 +4,18 @@ import { Fraction } from '../core/fraction'
 import { positionAt } from '../core/geometry'
 import type { Choreography } from '../core/types'
 
+/** 双人错峰预演候选：candidate 只在路点时刻上与正式编排不同，路径坐标相同 */
+export interface StagePreview {
+  candidate: Choreography
+  shifts: { id: number; delay: number }[]
+}
+
 const props = defineProps<{
   choreography: Choreography
   currentTime: number
   selectedPair: { aId: number; bId: number } | null
   witness: Fraction | null
+  preview?: StagePreview | null
 }>()
 
 const SIZE = 560
@@ -80,6 +87,39 @@ function inPair(id: number): boolean {
   const sp = props.selectedPair
   return !!sp && (id === sp.aId || id === sp.bId)
 }
+
+/** 预演覆盖层：只画两名选中舞者的候选轨迹（同色加粗虚线）与候选当前位置（空心方块） */
+const previewShifts = computed(() => {
+  const pv = props.preview
+  if (!pv) return []
+  const t = new Fraction(Math.round(props.currentTime * 100), 100)
+  return pv.shifts
+    .map((s) => {
+      const dancer = pv.candidate.find((d) => d.id === s.id)
+      const origin = props.choreography.find((d) => d.id === s.id)
+      if (!dancer || !origin) return null
+      const w = dancer.waypoints
+      const active = props.currentTime >= w[0]!.t && props.currentTime <= w[w.length - 1]!.t
+      let pos: { x: number; y: number } | null = null
+      if (active) {
+        const p = positionAt(dancer, t)
+        pos = { x: sf(p.x), y: sf(p.y) }
+      }
+      const idx = props.choreography.findIndex((d) => d.id === s.id)
+      return {
+        id: s.id,
+        delay: s.delay,
+        color: COLORS[((idx % COLORS.length) + COLORS.length) % COLORS.length]!,
+        // 坐标路径与正式编排一致，只时刻后移：直接画同一路径的虚线覆盖层
+        path: w.map((p) => `${sx(p.x)},${sy(p.y)}`).join(' '),
+        labelX: sx(w[0]!.x),
+        labelY: sy(w[0]!.y),
+        active,
+        pos
+      }
+    })
+    .filter((x): x is NonNullable<typeof x> => x !== null)
+})
 </script>
 
 <template>
@@ -155,11 +195,59 @@ function inPair(id: number): boolean {
         <circle :cx="sx(witnessView.ax)" :cy="sy(witnessView.ay)" r="6" fill="none" stroke="#ef6b6b" stroke-width="2" />
         <circle :cx="sx(witnessView.bx)" :cy="sy(witnessView.by)" r="6" fill="none" stroke="#ef6b6b" stroke-width="2" />
       </g>
+
+      <!-- 双人错峰预演候选轨迹：坐标路径相同（加粗虚线覆盖），候选位置用空心方块表示 -->
+      <g v-if="preview">
+        <g v-for="ps in previewShifts" :key="'pv' + ps.id">
+          <polyline
+            :points="ps.path"
+            fill="none"
+            :stroke="ps.color"
+            stroke-width="4"
+            stroke-dasharray="7 5"
+            stroke-linejoin="round"
+            opacity="0.55"
+          />
+          <rect
+            :x="ps.labelX - 6"
+            :y="ps.labelY - 16"
+            width="12"
+            height="12"
+            rx="2"
+            fill="#0f1420"
+            :stroke="ps.color"
+            stroke-width="1.4"
+          />
+          <text
+            :x="ps.labelX"
+            :y="ps.labelY - 20"
+            :fill="ps.color"
+            font-size="10"
+            text-anchor="middle"
+          >
+            +{{ ps.delay }}
+          </text>
+          <rect
+            v-if="ps.pos"
+            :x="sx(ps.pos.x) - 5"
+            :y="sy(ps.pos.y) - 5"
+            width="10"
+            height="10"
+            rx="1.5"
+            fill="#0f1420"
+            :stroke="ps.color"
+            stroke-width="2.4"
+          >
+            <title>预演候选位置 · 后移 {{ ps.delay }}</title>
+          </rect>
+        </g>
+      </g>
     </svg>
     <div class="legend">
       <span v-for="dv in dancersView" :key="dv.dancer.id" class="legend-item">
         <i :style="{ background: dv.color }" />{{ dv.dancer.name }} · r={{ dv.dancer.radius }}
       </span>
+      <span v-if="preview" class="legend-item note">虚线方框 = 错峰预演候选轨迹（不改正式编排）</span>
     </div>
   </div>
 </template>

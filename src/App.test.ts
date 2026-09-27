@@ -131,3 +131,161 @@ describe('App 页面集成 · 失败状态、重试与重编辑恢复（可控 W
     await vi.waitFor(() => expect(host.textContent).toContain('无冲突'))
   })
 })
+
+describe('App 页面 · 双人错峰预演（主线程兜底：预演、过期拒绝、应用后零冲突）', () => {
+  let host: HTMLElement
+
+  beforeEach(() => {
+    host = document.createElement('div')
+    document.body.appendChild(host)
+  })
+  afterEach(() => {
+    host.remove()
+  })
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  /** 用预设下拉切换场景 */
+  async function loadPreset(label: string) {
+    const select = host.querySelector('.presets select') as HTMLSelectElement
+    const opt = [...select.options].find((o) => o.textContent?.includes(label))!
+    select.value = opt.value
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await sleep(120)
+  }
+
+  /** 点开双人错峰预演面板，选好两人并点击“预演” */
+  async function runStagger(aId: number, bId: number) {
+    const panel = host.querySelector('.stagger')!
+    const [selA, selB] = panel.querySelectorAll('select')
+    ;(selA as HTMLSelectElement).value = String(aId)
+    ;(selA as HTMLSelectElement).dispatchEvent(new Event('change', { bubbles: true }))
+    ;(selB as HTMLSelectElement).value = String(bId)
+    ;(selB as HTMLSelectElement).dispatchEvent(new Event('change', { bubbles: true }))
+    ;[...panel.querySelectorAll('button')].find((b) => b.textContent?.includes('预演'))!.click()
+    await sleep(40)
+  }
+
+  it('预演：端点相接场景找到方案，展示候选轨迹与延迟；不改正式编排与正常报告', async () => {
+    createApp(App).mount(host)
+    await loadPreset('端点相接')
+
+    // 正式报告：1 条冲突
+    expect(host.textContent).toContain('1 条冲突线段')
+    const dancer2FirstT = () =>
+      (host.querySelectorAll('.dancer')[1]!.querySelector('tbody input') as HTMLInputElement).value
+    expect(dancer2FirstT()).toBe('10') // 舞者2 首路点时刻仍是 10
+
+    await runStagger(1, 2)
+
+    // 方案展示：后移 (0, 1)、和 1、消除 1 条
+    const panelText = host.querySelector('.stagger')!.textContent!
+    expect(panelText).toContain('找到安全方案')
+    expect(panelText).toContain('延迟之和')
+    expect(panelText).toContain('消除原有冲突')
+    expect(panelText).toContain('1 条')
+
+    // 候选轨迹覆盖层：虚线方框标记
+    const previewBoxes = host.querySelectorAll('.stage-svg rect')
+    expect(previewBoxes.length).toBeGreaterThan(0)
+    expect(host.textContent).toContain('错峰预演候选轨迹')
+
+    // 正式编排未被改动
+    expect(dancer2FirstT()).toBe('10')
+    // 正常判碰报告保持原样，仍有 1 条
+    expect(host.textContent).toContain('1 条冲突线段')
+    // 应用按钮可用
+    const applyBtn = [...host.querySelectorAll('.stagger button')].find((b) =>
+      b.textContent?.includes('应用到正式编排')
+    ) as HTMLButtonElement
+    expect(applyBtn).toBeTruthy()
+    expect(applyBtn.disabled).toBe(false)
+  })
+
+  it('过期拒绝：方案产生后再编辑，旧方案标记不可应用；重新预演后可正常应用且零冲突', async () => {
+    createApp(App).mount(host)
+    await loadPreset('端点相接')
+    await runStagger(1, 2)
+    expect(host.querySelector('.stagger')!.textContent).toContain('找到安全方案')
+
+    // 应用前编辑（改舞者1 半径）：方案立即过期
+    const radiusInputs = host.querySelectorAll('.r-input')
+    ;(radiusInputs[0] as HTMLInputElement).value = '2'
+    ;(radiusInputs[0] as HTMLInputElement).dispatchEvent(new Event('input', { bubbles: true }))
+    await sleep(120)
+
+    const panelText = () => host.querySelector('.stagger')!.textContent!
+    expect(panelText()).not.toContain('找到安全方案')
+    // 重新预演：编辑后的编排（端点相接，半径 2）仍然冲突、仍可被 +1 错开
+    await runStagger(1, 2)
+    expect(panelText()).toContain('找到安全方案')
+    const applyBtn = [...host.querySelectorAll('.stagger button')].find((b) =>
+      b.textContent?.includes('应用到正式编排')
+    ) as HTMLButtonElement
+    expect(applyBtn.disabled).toBe(false)
+
+    // 应用：一次性移动路点并重新分析
+    applyBtn.click()
+    await sleep(120)
+
+    // 舞者2 路点整体 +1：首路点 t 现在应为 11（原 10）
+    const secondDancerFirstT = (
+      host.querySelectorAll('.dancer')[1]!.querySelector('tbody input') as HTMLInputElement
+    ).value
+    expect(secondDancerFirstT).toBe('11')
+    // 舞者1 不动
+    const firstDancerFirstT = (
+      host.querySelectorAll('.dancer')[0]!.querySelector('tbody input') as HTMLInputElement
+    ).value
+    expect(firstDancerFirstT).toBe('0')
+
+    // 应用后零冲突
+    expect(host.textContent).toContain('无冲突')
+    // 预演面板回到空闲态（无方案、无候选覆盖层）
+    expect(host.querySelector('.stagger')!.textContent).not.toContain('找到安全方案')
+    expect(host.textContent).not.toContain('错峰预演候选轨迹')
+  })
+
+  it('无解：无法消除时给出明确无解说明且不可应用；正式报告不变', async () => {
+    createApp(App).mount(host)
+    await sleep(80)
+
+    // 直接构造“两人末时刻 600 且冲突”的无解编排：改默认场景
+    // 默认 graze 是 2 人，把两人末时刻都改为 600、路径改为反向相遇、半径各 1
+    const dancers = host.querySelectorAll('.dancer')
+    const setRow = (dancerEl: Element, row: number, t: string, x: string, y: string) => {
+      const inputs = dancerEl.querySelectorAll('tbody tr')[row]!.querySelectorAll('input')
+      const setVal = (el: Element, v: string) => {
+        const i = el as HTMLInputElement
+        i.value = v
+        i.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+      setVal(inputs[0]!, t)
+      setVal(inputs[1]!, x)
+      setVal(inputs[2]!, y)
+    }
+    const radius = host.querySelectorAll('.r-input')
+    ;(radius[0] as HTMLInputElement).value = '1'
+    ;(radius[0] as HTMLInputElement).dispatchEvent(new Event('input', { bubbles: true }))
+    ;(radius[1] as HTMLInputElement).value = '1'
+    ;(radius[1] as HTMLInputElement).dispatchEvent(new Event('input', { bubbles: true }))
+    setRow(dancers[0]!, 0, '590', '0', '0')
+    setRow(dancers[0]!, 1, '600', '10', '0')
+    setRow(dancers[1]!, 0, '590', '10', '0')
+    setRow(dancers[1]!, 1, '600', '0', '0')
+    await sleep(120)
+    expect(host.textContent).toContain('条冲突')
+
+    await runStagger(1, 2)
+    const panelText = host.querySelector('.stagger')!.textContent!
+    expect(panelText).toContain('无解')
+    expect(panelText).toContain('合法延迟范围内没有任何组合')
+    // 没有应用按钮 / 不可应用
+    const applyBtn = [...host.querySelectorAll('.stagger button')].find((b) =>
+      b.textContent?.includes('应用到正式编排')
+    )
+    expect(applyBtn).toBeUndefined()
+    // 正式报告保持原样
+    expect(host.textContent).toContain('条冲突')
+  })
+})

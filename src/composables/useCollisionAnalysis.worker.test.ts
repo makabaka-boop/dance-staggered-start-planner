@@ -1,8 +1,16 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { useCollisionAnalysis } from './useCollisionAnalysis'
 import { PRESETS } from '../data/presets'
+import { analyzeChoreography } from '../core/choreography'
+import { planStagger } from '../core/stagger'
 import type { Choreography } from '../core/types'
-import type { AnalyzeRequest, AnalyzeResponse } from '../workers/analysis.worker'
+import type {
+  AnalyzeRequest,
+  AnalyzeResponse,
+  StaggerRequestMessage,
+  StaggerResponse,
+  WorkerRequest
+} from '../workers/analysis.worker'
 
 /**
  * 可控的假 Worker：保留每次 postMessage 的请求（版本 + 编排快照），
@@ -16,16 +24,16 @@ class MockWorker {
     MockWorker.instances = []
   }
 
-  onmessage: ((e: MessageEvent<AnalyzeResponse>) => void) | null = null
+  onmessage: ((e: MessageEvent<AnalyzeResponse | StaggerResponse>) => void) | null = null
   onerror: ((e: ErrorEvent) => void) | null = null
-  posted: AnalyzeRequest[] = []
+  posted: WorkerRequest[] = []
   terminated = false
 
   constructor(_url: URL, _opts?: unknown) {
     MockWorker.instances.push(this)
   }
 
-  postMessage(req: AnalyzeRequest) {
+  postMessage(req: WorkerRequest) {
     this.posted.push(req)
   }
   terminate() {
@@ -39,6 +47,18 @@ class MockWorker {
   }
   reply(version: number, over: Partial<AnalyzeResponse> = {}) {
     this.onmessage?.({ data: { version, ...over } } as MessageEvent<AnalyzeResponse>)
+  }
+  /** 回最后一条 stagger 请求的方案 */
+  replyStagger(over: Partial<StaggerResponse> = {}) {
+    const req = [...this.posted].reverse().find((r) => r.kind === 'stagger') as StaggerRequestMessage
+    this.onmessage?.({
+      data: { kind: 'stagger', version: req.version, seq: req.seq, ...over }
+    } as MessageEvent<StaggerResponse>)
+  }
+  replyStaggerAt(version: number, seq: number, over: Partial<StaggerResponse> = {}) {
+    this.onmessage?.({
+      data: { kind: 'stagger', version, seq, ...over }
+    } as MessageEvent<StaggerResponse>)
   }
   crash(message = 'worker crashed') {
     this.onerror?.({ message } as ErrorEvent)
@@ -247,5 +267,159 @@ describe('useCollisionAnalysis · Web Worker 事件与版本协议', () => {
     worker().replyLast({ report: reportOf(1) })
     expect(ua.report.value).not.toBeNull()
     expect(ua.error.value).toBeNull()
+  })
+})
+
+describe('useCollisionAnalysis · 双人错峰预演的 Worker 事件协议', () => {
+  let savedWorker: typeof globalThis.Worker
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    MockWorker.reset()
+    savedWorker = globalThis.Worker
+    globalThis.Worker = MockWorker as unknown as typeof globalThis.Worker
+  })
+  afterEach(() => {
+    globalThis.Worker = savedWorker
+    vi.useRealTimers()
+  })
+
+  const worker = () => MockWorker.instances[MockWorker.instances.length - 1]!
+  const endpointTouch = (): Choreography => JSON.parse(JSON.stringify(PRESETS[2].data))
+  /** 端点相接场景的真实方案：推迟舞者2 1 个单位即 (0,1) */
+  const realPlanPayload = () =>
+    planStagger({ choreography: endpointTouch(), dancerIds: [1, 2] })
+
+  it('预演请求走 Worker、携带版本+seq+快照；回复落地为 activePlan', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+    expect(ua.report.value).not.toBeNull()
+
+    ua.requestStagger([2, 1])
+    const req = worker().posted.at(-1)!
+    expect(req.kind).toBe('stagger')
+    if (req.kind !== 'stagger') return
+    expect(req.version).toBe(1)
+    expect(req.seq).toBe(1)
+    expect(req.dancerIds).toEqual([1, 2])
+    // 快照与当前编排一致
+    expect(req.choreography[1]!.waypoints[0]!.t).toBe(10)
+
+    worker().replyStagger({ plan: realPlanPayload() })
+    expect(ua.planComputing.value).toBe(false)
+    expect(ua.activePlan.value?.plan.found).toBe(true)
+    expect(ua.activePlan.value?.version).toBe(1)
+    // 正常判碰报告保持原样
+    expect(ua.report.value).not.toBeNull()
+  })
+
+  it('旧预演（seq 更小）的迟到成功 / 失败回复一律丢弃', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+
+    ua.requestStagger([1, 2]) // seq 1 在途
+    ua.requestStagger([1, 2]) // seq 2 成为最新
+    // seq1 迟到失败：丢弃
+    worker().replyStaggerAt(1, 1, { error: 'late stagger failure' })
+    expect(ua.planError.value).toBeNull()
+    expect(ua.planComputing.value).toBe(true)
+    // seq1 迟到成功：同样丢弃
+    worker().replyStaggerAt(1, 1, { plan: realPlanPayload() })
+    expect(ua.activePlan.value).toBeNull()
+    // seq2 成功落地
+    worker().replyStaggerAt(1, 2, { plan: realPlanPayload() })
+    expect(ua.activePlan.value?.plan.found).toBe(true)
+  })
+
+  it('编辑（version 变化）后：旧版本 stagger 回复被丢弃；在途方案同步作废', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+
+    ua.requestStagger([1, 2]) // v1 seq1 在途
+    c[0]!.radius += 1
+    ua.scheduleRun() // 同步作废预演、进入 v2 分析
+    expect(ua.activePlan.value).toBeNull()
+    expect(ua.planComputing.value).toBe(false)
+    flushDebounceHelper()
+    // v1 的预演回复此刻才回来：必须丢弃
+    worker().replyStaggerAt(1, 1, { plan: realPlanPayload() })
+    expect(ua.activePlan.value).toBeNull()
+
+    function flushDebounceHelper() {
+      vi.advanceTimersByTime(61)
+    }
+  })
+
+  it('Worker 回 stagger 错误响应：明确预演失败态，正常报告不受影响，可重新预演', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+    const reportSnapshot = ua.report.value
+
+    ua.requestStagger([1, 2])
+    worker().replyStagger({ error: 'stagger boom' })
+    expect(ua.planComputing.value).toBe(false)
+    expect(ua.planError.value).toBe('stagger boom')
+    expect(ua.activePlan.value).toBeNull()
+    expect(ua.planApplicable.value).toBe(false)
+    expect(ua.report.value).toBe(reportSnapshot)
+
+    // 重新预演正常
+    ua.requestStagger([1, 2])
+    worker().replyStagger({ plan: realPlanPayload() })
+    expect(ua.planError.value).toBeNull()
+    expect(ua.activePlan.value?.plan.found).toBe(true)
+  })
+
+  it('Worker 进程崩溃：在途预演进入明确失败态；重编辑后恢复正常', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+
+    ua.requestStagger([1, 2])
+    worker().crash('process died during stagger')
+    expect(ua.planComputing.value).toBe(false)
+    expect(ua.planError.value).toContain('process died')
+    expect(ua.activePlan.value).toBeNull()
+
+    // 重新编辑后：错误清掉、惰性重建 Worker、预演仍可用
+    c[0]!.waypoints[1]!.x += 1
+    ua.scheduleRun()
+    vi.advanceTimersByTime(61)
+    expect(MockWorker.instances.length).toBe(2)
+    worker().replyLast({ report: analyzeChoreography(c) })
+    ua.requestStagger([1, 2])
+    expect(worker().posted.at(-1)!.kind).toBe('stagger')
+    worker().replyStagger({ plan: realPlanPayload() })
+    expect(ua.activePlan.value?.plan.found).toBe(true)
+  })
+
+  it('旧版本 stagger 回复不影响当前版本正常判碰结果', () => {
+    const c = endpointTouch()
+    const ua = useCollisionAnalysis(() => c)
+    ua.run()
+    worker().replyLast({ report: analyzeChoreography(c) })
+    ua.requestStagger([1, 2]) // v1 预演在途
+
+    // 编辑进入 v2 正常分析
+    c[1]!.waypoints[0]!.y += 5
+    ua.scheduleRun()
+    vi.advanceTimersByTime(61)
+    // 旧 stagger 回复到达
+    worker().replyStaggerAt(1, 1, { error: 'late' })
+    expect(ua.activePlan.value).toBeNull()
+    expect(ua.planError.value).toBeNull()
+    // v2 正常判碰完成
+    worker().replyLast({ report: analyzeChoreography(c) })
+    expect(ua.report.value).not.toBeNull()
+    expect(ua.computing.value).toBe(false)
   })
 })

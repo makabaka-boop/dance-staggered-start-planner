@@ -4,6 +4,7 @@ import StageView from './components/StageView.vue'
 import TimeSlider from './components/TimeSlider.vue'
 import ConflictReport from './components/ConflictReport.vue'
 import DancerEditor from './components/DancerEditor.vue'
+import StaggerPanel from './components/StaggerPanel.vue'
 import { PRESETS } from './data/presets'
 import { useCollisionAnalysis } from './composables/useCollisionAnalysis'
 import { Fraction } from './core/fraction'
@@ -11,8 +12,23 @@ import type { ConflictDTO, PairReportDTO } from './core/types'
 
 const choreography = reactive(structuredClone(PRESETS[0].data))
 
-const { version, report, issues, computing, error: analysisError, scheduleRun, run, retry } =
-  useCollisionAnalysis(() => choreography)
+const {
+  version,
+  report,
+  issues,
+  computing,
+  error: analysisError,
+  scheduleRun,
+  run,
+  retry,
+  activePlan,
+  planComputing,
+  planError,
+  planApplicable,
+  requestStagger,
+  discardPlan,
+  applyPlan
+} = useCollisionAnalysis(() => choreography)
 
 // 编辑后在同一渲染周期内同步作废旧版本（version++、清报告与计算状态），
 // 60ms 防抖只推迟开始计算；因此拖动期间旧标记 / 旧证据不会盖在新路径上
@@ -109,6 +125,31 @@ const invalid = computed(() => issues.value.length > 0)
 const conflictTotal = computed(() =>
   report.value ? report.value.reports.reduce((n, r) => n + r.conflicts.length, 0) : 0
 )
+
+// ---- 双人错峰预演 ----
+/** 只有当前版本的正常判碰报告就绪时才允许发起预演 */
+const canRequestStagger = computed(
+  () => !computing.value && !analysisError.value && !invalid.value && !!report.value
+)
+
+/** 预演候选（仅当方案可行时用于舞台覆盖展示）；预演不改正式编排与正常报告 */
+const stagePreview = computed(() => {
+  const ap = activePlan.value
+  if (!ap) return null
+  const plan = ap.plan
+  if (!plan.found) return null
+  return {
+    candidate: plan.candidate,
+    shifts: plan.dancerIds.map((id, i) => ({ id, delay: plan.delays[i]! }))
+  }
+})
+
+function onRequestStagger(ids: [number, number]) {
+  requestStagger(ids)
+}
+function onApplyStagger() {
+  applyPlan()
+}
 </script>
 
 <template>
@@ -135,8 +176,21 @@ const conflictTotal = computed(() =>
         :current-time="currentTime"
         :selected-pair="selectedPair"
         :witness="witness"
+        :preview="stagePreview"
       />
     </div>
+
+    <StaggerPanel
+      :choreography="choreography"
+      :active-plan="activePlan"
+      :plan-computing="planComputing"
+      :plan-error="planError"
+      :plan-applicable="planApplicable"
+      :can-request="canRequestStagger"
+      @request="onRequestStagger"
+      @discard="discardPlan"
+      @apply="onApplyStagger"
+    />
 
     <TimeSlider
       :current-time="currentTime"
