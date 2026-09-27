@@ -4,8 +4,11 @@ import StageView from './components/StageView.vue'
 import TimeSlider from './components/TimeSlider.vue'
 import ConflictReport from './components/ConflictReport.vue'
 import DancerEditor from './components/DancerEditor.vue'
+import StaggerPlanner from './components/StaggerPlanner.vue'
 import { PRESETS } from './data/presets'
 import { useCollisionAnalysis } from './composables/useCollisionAnalysis'
+import { applyStaggerPreview, planTwoDancerStagger, previewVersionMatches } from './core/stagger'
+import type { StaggerNoSolution, StaggerPreview } from './core/stagger'
 import { Fraction } from './core/fraction'
 import type { ConflictDTO, PairReportDTO } from './core/types'
 
@@ -13,6 +16,12 @@ const choreography = reactive(structuredClone(PRESETS[0].data))
 
 const { version, report, issues, computing, error: analysisError, scheduleRun, run, retry } =
   useCollisionAnalysis(() => choreography)
+
+const staggerPreview = ref<StaggerPreview | null>(null)
+const staggerNoSolution = ref<StaggerNoSolution | null>(null)
+const staggerError = ref<string | null>(null)
+/** 预演生成后，任何后续版本变化都使其成为不可应用的旧方案 */
+const staggerStale = ref(false)
 
 // 编辑后在同一渲染周期内同步作废旧版本（version++、清报告与计算状态），
 // 60ms 防抖只推迟开始计算；因此拖动期间旧标记 / 旧证据不会盖在新路径上
@@ -84,6 +93,11 @@ const marks = computed(() => {
   )
 })
 
+const previewDancerIds = computed(() => staggerPreview.value?.dancerIds ?? [])
+const previewChoreography = computed(() =>
+  staggerPreview.value && !staggerStale.value ? staggerPreview.value.candidate : null
+)
+
 function onSelect(payload: { pair: PairReportDTO; conflict: ConflictDTO; key: string } | null) {
   if (!payload) {
     selectedKey.value = null
@@ -103,7 +117,63 @@ function onSeekFraction(f: Fraction) {
 // 让路径、标记、证据、报告同属一版；新报告返回后也不允许旧选择残留
 watch(version, () => {
   selectedKey.value = null
+  staggerNoSolution.value = null
+  staggerError.value = null
+  if (staggerPreview.value) staggerStale.value = true
 })
+
+watch(analysisError, (failed) => {
+  if (failed) staggerStale.value = true
+})
+
+function onRequestStagger(payload: { firstId: number; secondId: number }) {
+  staggerNoSolution.value = null
+  staggerError.value = null
+  staggerPreview.value = null
+  staggerStale.value = false
+  if (!report.value || computing.value || analysisError.value || issues.value.length > 0) {
+    staggerError.value = '请等待当前正式分析成功后再预演。'
+    return
+  }
+
+  const result = planTwoDancerStagger(
+    JSON.parse(JSON.stringify(choreography)),
+    payload.firstId,
+    payload.secondId,
+    version.value,
+    report.value
+  )
+  if (result.status === 'solution') {
+    staggerPreview.value = result.preview
+  } else if (result.status === 'no-solution') {
+    staggerNoSolution.value = result.result
+  } else {
+    staggerError.value = result.message
+  }
+}
+
+function onApplyStagger() {
+  const candidate = staggerPreview.value
+  if (!candidate || !previewVersionMatches(candidate, version.value) || staggerStale.value) return
+  if (!report.value || computing.value || analysisError.value || issues.value.length > 0) {
+    staggerStale.value = true
+    return
+  }
+
+  // 核对通过后一次性提交两路点时间；同一个 watch 负责同步作废与重新分析。
+  applyStaggerPreview(choreography, candidate)
+  staggerPreview.value = null
+  staggerNoSolution.value = null
+  staggerError.value = null
+  staggerStale.value = false
+}
+
+function onDiscardStagger() {
+  staggerPreview.value = null
+  staggerNoSolution.value = null
+  staggerError.value = null
+  staggerStale.value = false
+}
 
 const invalid = computed(() => issues.value.length > 0)
 const conflictTotal = computed(() =>
@@ -129,12 +199,30 @@ const conflictTotal = computed(() =>
 
     <DancerEditor :choreography="choreography" :issues="issues" :version="version" />
 
+    <StaggerPlanner
+      :choreography="choreography"
+      :report="report"
+      :computing="computing"
+      :invalid="invalid"
+      :error="analysisError"
+      :version="version"
+      :preview="staggerPreview"
+      :preview-stale="staggerStale"
+      :no-solution="staggerNoSolution"
+      :error-message="staggerError"
+      @preview="onRequestStagger"
+      @apply="onApplyStagger"
+      @discard="onDiscardStagger"
+    />
+
     <div class="panel stage-panel" style="grid-area: stage">
       <StageView
         :choreography="choreography"
         :current-time="currentTime"
         :selected-pair="selectedPair"
         :witness="witness"
+        :preview-choreography="previewChoreography"
+        :preview-dancer-ids="previewDancerIds"
       />
     </div>
 

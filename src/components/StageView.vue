@@ -9,6 +9,8 @@ const props = defineProps<{
   currentTime: number
   selectedPair: { aId: number; bId: number } | null
   witness: Fraction | null
+  previewChoreography?: Choreography | null
+  previewDancerIds?: number[]
 }>()
 
 const SIZE = 560
@@ -76,6 +78,21 @@ const witnessView = computed(() => {
   }
 })
 
+const PREVIEW_COLOR = '#f4d35e'
+
+const previewDancerView = computed(() => {
+  const candidate = props.previewChoreography
+  const ids = props.previewDancerIds ?? []
+  if (!candidate || ids.length === 0) return []
+  return candidate
+    .filter((d) => ids.includes(d.id))
+    .map((d) => ({
+      dancer: d,
+      path: d.waypoints.map((p) => `${sx(p.x)},${sy(p.y)}`).join(' '),
+      points: d.waypoints.map((p, i) => ({ x: sx(p.x), y: sy(p.y), t: p.t, i }))
+    }))
+})
+
 function inPair(id: number): boolean {
   const sp = props.selectedPair
   return !!sp && (id === sp.aId || id === sp.bId)
@@ -140,6 +157,30 @@ function inPair(id: number): boolean {
             <title>{{ dv.dancer.name }} @ t={{ currentTime.toFixed(2) }}</title>
           </circle>
         </template>
+      </g>
+
+      <g v-for="pv in previewDancerView" :key="'preview-' + pv.dancer.id">
+        <polyline
+          :points="pv.path"
+          fill="none"
+          :stroke="PREVIEW_COLOR"
+          stroke-width="3.4"
+          stroke-dasharray="8 5"
+          stroke-linejoin="round"
+          opacity="0.95"
+        />
+        <circle
+          v-for="p in pv.points"
+          :key="p.i"
+          :cx="p.x"
+          :cy="p.y"
+          r="4.4"
+          fill="none"
+          :stroke="PREVIEW_COLOR"
+          stroke-width="2"
+        >
+          <title>预演舞者 #{{ pv.dancer.id }} 路点 {{ p.i }} · t={{ p.t }}</title>
+        </circle>
       </g>
 
       <g v-if="witnessView">
